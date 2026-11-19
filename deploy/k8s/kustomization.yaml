@@ -1,0 +1,15 @@
+# kubectl apply -k deploy/k8s
+# Secrets are NOT generated from this directory (keep them out of git); create
+# secretproxy-secrets and secretproxy-ca with kubectl first (see README).
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: agents
+resources:
+  - namespace.yaml
+  - networkpolicy.yaml
+  - agent-pod.yaml
+configMapGenerator:
+  - name: secretproxy-config
+    files: [config.yaml]
+  - name: agent-placeholders              # secretproxy sandbox-env -c config.yaml > placeholders.env
+    envs: [placeholders.env]

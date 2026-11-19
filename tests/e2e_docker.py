@@ -1,6 +1,11 @@
 """End-to-end test of the transparent path in Docker.
 
-    python tests/e2e_docker.py [--keep]
+    python tests/e2e_docker.py [--topology local|routed|pod] [--keep]
+
+    local   sandbox shares the gateway's network namespace (= proxy and app on one VM)
+    routed  sandbox on an internal network, default route via the gateway
+            (= gateway VM + client VM)
+    pod     Docker model of the Kubernetes pod: init container + sidecar + agent
 
 1. Generates the proxy CA, a throwaway "public" CA + cert for the fake upstream,
    random real secrets for the three providers (file/.env, env, cmd), and the
@@ -28,7 +33,11 @@ from urllib.parse import quote_plus
 ROOT = Path(__file__).resolve().parents[1]
 DEPLOY = ROOT / "deploy"
 RT = DEPLOY / "runtime"
-COMPOSE = ["docker", "compose", "-f", str(DEPLOY / "docker-compose.yml")]
+COMPOSE_FILES = {"local": "docker-compose.yml", "routed": "docker-compose.routed.yml",
+                 "pod": "docker-compose.pod.yml"}
+GATEWAY_SERVICE = {"local": "gateway", "routed": "gateway", "pod": "proxy"}
+GW = ["gateway"]  # service running the proxy; set in main()
+COMPOSE: list[str] = []  # set in main() from --topology
 
 
 def run(args, *, input=None, check=True, cwd=ROOT, timeout=900) -> str:
@@ -97,7 +106,11 @@ def setup() -> dict[str, str]:
     w = lambda p, s: p.write_text(s, encoding="utf-8", newline="\n")
     w(RT / "secrets" / "fakeapi.env", f'# gateway-only .env\nOTHER=1\nFAKEAPI_TOKEN="{real["fakeapi"]}"\n')
     w(RT / "secrets" / "cmd_token", real["cmdtoken"] + "\n")
-    w(RT / "gateway.env", f"ENV_TOKEN={real['envtoken']}\n")
+    w(RT / "secrets.env", f"ENV_TOKEN={real['envtoken']}\n")
+    # Upstream trust for the gateway: public roots + the demo's "public" test CA.
+    import certifi
+    w(RT / "certs" / "upstream-ca.pem", Path(certifi.where()).read_text(encoding="utf-8")
+      + (RT / "certs" / "public-test-ca.pem").read_text(encoding="utf-8"))
     w(RT / "sandbox.env",
       run([sys.executable, "-m", "secretproxy", "sandbox-env", "-c", str(DEPLOY / "config.yaml")]))
     return real
@@ -107,15 +120,15 @@ def up() -> None:
     run(COMPOSE + ["up", "-d", "--build", "--force-recreate"], timeout=1800)
     deadline = time.time() + 90
     while time.time() < deadline:
-        # mitmdump listening on 127.0.0.1:8080 (0100007F:1F90, state 0A = LISTEN)?
-        tcp = run(COMPOSE + ["exec", "-T", "gateway", "cat", "/proc/net/tcp"], check=False)
-        if any(f[1] == "0100007F:1F90" and f[3] == "0A"
+        # proxy listening on 127.0.0.1:8080 or 0.0.0.0:8080 (state 0A = LISTEN)?
+        tcp = run(COMPOSE + ["exec", "-T", GW[0], "cat", "/proc/net/tcp"], check=False)
+        if any(f[1] in ("0100007F:1F90", "00000000:1F90") and f[3] == "0A"
                for f in (l.split() for l in tcp.splitlines()[1:]) if len(f) > 3):
             return
         if "exited with code" in run(COMPOSE + ["ps", "-a"], check=False):
             break
         time.sleep(1)
-    raise RuntimeError("gateway did not start:\n" + run(COMPOSE + ["logs", "gateway"], check=False))
+    raise RuntimeError("gateway did not start:\n" + run(COMPOSE + ["logs", GW[0]], check=False))
 
 
 # ------------------------------------------------------------------ checks
@@ -123,23 +136,31 @@ def up() -> None:
 
 def main() -> int:
     ap = argparse.ArgumentParser()
+    ap.add_argument("--topology", choices=sorted(COMPOSE_FILES), default="local")
     ap.add_argument("--keep", action="store_true", help="leave the stack running afterwards")
     args = ap.parse_args()
+    COMPOSE[:] = ["docker", "compose", "-f", str(DEPLOY / COMPOSE_FILES[args.topology])]
+    GW[0] = GATEWAY_SERVICE[args.topology]
+    AGENT = ["exec", "-T", "-u", "1000:1000", "sandbox"]  # what the agent can do
 
     real = setup()
     ph = {line.split("=", 1)[0]: line.split("=", 1)[1]
           for line in (RT / "sandbox.env").read_text().splitlines() if "=" in line}
     PH_FA, PH_ENV, PH_CMD = ph["FAKEAPI_TOKEN"], ph["ENV_TOKEN"], ph["CMD_TOKEN"]
-    print("building and starting the stack ...", flush=True)
+    print(f"building and starting the {args.topology} stack ...", flush=True)
     up()
     try:
-        probe = json.loads(run(COMPOSE + ["exec", "-T", "sandbox", "python3", "-"],
+        probe = json.loads(run(COMPOSE + AGENT + ["python3", "-"],
                                input=(ROOT / "tests" / "sandbox_probe.py").read_text()))
         upstream = [json.loads(l) for l in
                     run(COMPOSE + ["exec", "-T", "fakeapi", "cat", "/log/requests.jsonl"]).splitlines() if l]
-        audit_raw = run(COMPOSE + ["exec", "-T", "gateway", "cat", "/home/mitm/audit.jsonl"], check=False)
-        gateway_logs = run(COMPOSE + ["logs", "gateway"], check=False)
-        proc_dump = run(COMPOSE + ["exec", "-T", "sandbox", "sh", "-c",
+        # Read as the proxy user: its home is 0700, and the gateway's root has no DAC override.
+        audit_raw = run(COMPOSE + ["exec", "-T", "-u", "10001:10001", GW[0],
+                                   "cat", "/home/mitm/audit.jsonl"])
+        gateway_logs = run(COMPOSE + ["logs", GW[0]], check=False)
+        gw_forward = run(COMPOSE + ["exec", "-T", GW[0], "cat", "/proc/sys/net/ipv4/ip_forward"],
+                         check=False).strip()
+        proc_dump = run(COMPOSE + AGENT + ["sh", "-c",
                                    "cat /proc/[0-9]*/environ /proc/[0-9]*/cmdline 2>/dev/null; env"],
                         check=False)
         cid = run(COMPOSE + ["ps", "-q", "sandbox"]).strip()
@@ -170,10 +191,28 @@ def main() -> int:
     check("sandbox env holds placeholders only",
           probe["placeholders"] == {"FAKEAPI_TOKEN": PH_FA, "ENV_TOKEN": PH_ENV, "CMD_TOKEN": PH_CMD})
     check("gateway secrets not visible in sandbox", not probe["secrets_dir_visible"])
-    check("sandbox runs as unprivileged uid 1000", probe["whoami"].startswith("uid=1000"), probe["whoami"])
+    p1 = probe["pid1"]
+    check("sandbox main process: uid 1000, no capabilities",
+          p1.get("Uid") == "1000" and int(p1.get("CapEff", "1"), 16) == 0
+          and int(p1.get("CapBnd", "1"), 16) == 0, str(p1))
+    check("proxy port unreachable except via the redirect",
+          probe["direct_proxy_port"] and all(v != "connected" for v in probe["direct_proxy_port"].values()),
+          str(probe["direct_proxy_port"]))
+    if args.topology == "routed":
+        check("sandbox default route is the gateway", probe["default_gateway"] == "10.88.0.2",
+              str(probe["default_gateway"]))
+        check("agent cannot change its route", probe["route_change"]["rc"] != 0,
+              str(probe["route_change"]))
+        check("gateway forwards nothing (ip_forward=0)", gw_forward == "0", gw_forward)
+
     check("sandbox TLS to bound host is intercepted (mitmproxy CA)",
           probe["mitm"].get("ok") and "mitmproxy" in json.dumps(probe["mitm"].get("issuer", {})),
           str(probe["mitm"]))
+
+    check("DNS: allowed domain resolves", not probe["dns_allowed"].startswith("error"),
+          probe["dns_allowed"])
+    check("DNS: unlisted domain refused (no DNS exfiltration)",
+          probe["dns_unlisted"].startswith("error"), probe["dns_unlisted"])
 
     # -- injection, one per provider
     h = probe["header"]
@@ -207,8 +246,11 @@ def main() -> int:
 
     # -- exfiltration / policy
     ev = probe["exfil_denied_host"]
-    check("placeholder to non-allowed host refused (403), never reached upstream",
-          ev["code"] == "403" and not [x for x in upstream if (x["host"] or "").startswith("evil.")], ev["body"][:120])
+    # Refused at DNS (allowlist) or by the proxy (403); either way it never reaches upstream.
+    check("placeholder to non-allowed host refused, never reached upstream",
+          (ev["code"] == "403" or "resolve" in ev["err"].lower())
+          and not [x for x in upstream if (x["host"] or "").startswith("evil.")],
+          ev["code"] + " " + ev["err"][:120])
     ie = probe["exfil_intercepted_host"]
     check("placeholder to allowed-but-unbound host refused (403)",
           ie["code"] == "403" and "not valid" in ie["body"] and not seen("/v1/echo", "intercepted."), ie["body"][:160])

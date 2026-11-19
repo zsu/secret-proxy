@@ -7,7 +7,7 @@ name = "secret-proxy"
 version = "0.1.0"
 description = "Transparent secret-injection proxy for agent sandboxes (mitmproxy addon)"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.12"   # mitmproxy 12 needs 3.12+
 license = "MIT"
 dependencies = [
     "mitmproxy>=12.3,<13",

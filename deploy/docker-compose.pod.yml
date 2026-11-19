@@ -1,0 +1,76 @@
+# Topology "pod": a faithful Docker model of deploy/k8s/agent-pod.yaml, so the
+# Kubernetes design is tested without a cluster. Same images, users, capabilities
+# and read-only filesystems as the pod spec:
+#
+#   pod           = the pod's network namespace (Kubernetes' pause container)
+#   egress-rules  = initContainer: root, NET_ADMIN + NET_RAW only, exits after applying rules
+#   proxy         = native sidecar: uid 10001, no capabilities, read-only root filesystem
+#   sandbox       = the agent container: uid 1000, no capabilities
+name: secretproxy-pod
+
+services:
+  fakeapi:
+    build: { context: .., dockerfile: deploy/fakeapi/Dockerfile }
+    networks:
+      default:
+        aliases: [api.example.test, evil.example.test, tunnel.example.test, intercepted.example.test]
+
+  pod:
+    build: { context: .., dockerfile: deploy/gateway/Dockerfile }
+    entrypoint: ["sleep", "infinity"]
+    user: "65534:65534"
+    cap_drop: [ALL]
+    read_only: true
+    depends_on: [fakeapi]
+
+  egress-rules:
+    build: { context: .., dockerfile: deploy/gateway/Dockerfile }
+    entrypoint: ["egress-rules.sh", "apply"]
+    network_mode: "service:pod"
+    user: "0:0"
+    cap_drop: [ALL]
+    cap_add: [NET_ADMIN, NET_RAW]
+    security_opt: ["no-new-privileges:true"]
+    read_only: true
+    environment: { MODE: local, PROXY_USER: mitm, PROXY_PORT: "8080", DNS_PORT: "5353" }
+    restart: "no"
+    depends_on: [pod]
+
+  proxy:
+    build: { context: .., dockerfile: deploy/gateway/Dockerfile }
+    network_mode: "service:pod"
+    user: "10001:10001"
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    read_only: true
+    tmpfs:                                    # = emptyDir volumes (fsGroup 10001 in the pod)
+      - /tmp:mode=1777
+      - /home/mitm:uid=10001,gid=10001,mode=0700
+    environment:
+      MODE: local
+      CONFDIR: /etc/secretproxy/ca
+      UPSTREAM_CA: /etc/secretproxy/upstream-ca.pem
+      CREDENTIALS_DIRECTORY: /run/secrets
+    env_file: [runtime/secrets.env]
+    secrets:
+      - { source: fakeapi_env, target: fakeapi.env }
+      - { source: cmd_token, target: cmd_token }
+    volumes:
+      - ./config.yaml:/etc/secretproxy/config.yaml:ro
+      - ./runtime/ca:/etc/secretproxy/ca:ro   # = the secretproxy-ca Secret, read-only
+      - ./runtime/certs/upstream-ca.pem:/etc/secretproxy/upstream-ca.pem:ro
+    depends_on:
+      egress-rules: { condition: service_completed_successfully }
+
+  sandbox:
+    build: { context: .., dockerfile: deploy/sandbox/Dockerfile }
+    network_mode: "service:pod"
+    user: "1000:1000"
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    env_file: [runtime/sandbox.env]
+    depends_on: [proxy]
+
+secrets:
+  fakeapi_env: { file: ./runtime/secrets/fakeapi.env }
+  cmd_token: { file: ./runtime/secrets/cmd_token }

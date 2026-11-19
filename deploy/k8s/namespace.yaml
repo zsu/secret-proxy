@@ -1,0 +1,14 @@
+# The egress-rules init container needs NET_ADMIN/NET_RAW, which Pod Security
+# "baseline"/"restricted" forbid, so this namespace enforces "privileged" while
+# warning and auditing at "restricted" (every other container already complies).
+# Keep agent workloads in their own namespace so this exception stays narrow.
+# To avoid the exception entirely, move the iptables setup to a node-level CNI
+# plugin (the istio-cni approach); see README.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: agents
+  labels:
+    pod-security.kubernetes.io/enforce: privileged
+    pod-security.kubernetes.io/warn: restricted
+    pod-security.kubernetes.io/audit: restricted

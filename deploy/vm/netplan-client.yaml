@@ -1,0 +1,16 @@
+# /etc/netplan/60-secretproxy.yaml on each CLIENT VM (chmod 600; then: sudo netplan apply)
+# Its only NIC is on the isolated sandbox network; the gateway VM is both its
+# default route and its DNS server. Remove other netplan files that configure eth0.
+network:
+  version: 2
+  ethernets:
+    eth0:
+      dhcp4: false
+      dhcp6: false
+      accept-ra: false
+      addresses: [10.88.0.10/24]        # .11, .12, ... for more clients
+      routes:
+        - to: default
+          via: 10.88.0.2                # gateway VM's eth1
+      nameservers:
+        addresses: [10.88.0.2]

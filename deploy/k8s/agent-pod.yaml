@@ -1,0 +1,139 @@
+# Agent pod with the secretproxy sidecar (Kubernetes >= 1.29 for native sidecars).
+#
+#   egress-rules (init)  root, NET_ADMIN + NET_RAW only: installs the pod's iptables
+#                        rules (80/443 -> proxy, DNS -> allowlist resolver, rest refused),
+#                        then exits. Same pattern as istio-init.
+#   trust-bundle (init)  builds "system roots + proxy CA" for the agent. No privileges.
+#   secretproxy (sidecar) uid 10001, no capabilities, read-only root FS. The only
+#                        container that mounts the secrets and the CA key.
+#   agent                your workload: uid 1000, no capabilities, no service-account
+#                        token, no secrets - only placeholders in its env.
+#
+# The Docker model of this exact pod (deploy/docker-compose.pod.yml) is what
+# `python tests/e2e_docker.py --topology pod` tests.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: agent
+  labels: { app: agent }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: agent }
+  template:
+    metadata:
+      labels: { app: agent, secretproxy: enabled }
+    spec:
+      automountServiceAccountToken: false   # the agent gets no Kubernetes API credentials
+      enableServiceLinks: false             # no *_SERVICE_HOST env vars about the cluster
+      shareProcessNamespace: false          # the agent can't see the proxy's processes
+      securityContext:
+        seccompProfile: { type: RuntimeDefault }
+        fsGroup: 10001                      # secret files readable by the proxy user
+      initContainers:
+        - name: egress-rules
+          image: secretproxy-gateway:0.1.0
+          command: ["egress-rules.sh", "apply"]
+          env:
+            - { name: MODE, value: local }
+            - { name: PROXY_USER, value: mitm }
+            - { name: PROXY_PORT, value: "8080" }
+            - { name: DNS_PORT, value: "5353" }
+          securityContext:
+            runAsUser: 0
+            runAsNonRoot: false
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: [ALL], add: [NET_ADMIN, NET_RAW] }
+          resources:
+            requests: { cpu: 10m, memory: 16Mi }
+            limits: { cpu: 100m, memory: 64Mi }
+
+        - name: trust-bundle
+          image: secretproxy-gateway:0.1.0
+          command: ["sh", "-c", "cat /etc/ssl/certs/ca-certificates.crt /proxy-ca/ca.crt > /trust/ca-bundle.crt && cp /proxy-ca/ca.crt /trust/proxy-ca.crt"]
+          securityContext:
+            runAsUser: 10001
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: [ALL] }
+          volumeMounts:
+            - { name: proxy-ca-cert, mountPath: /proxy-ca, readOnly: true }
+            - { name: trust, mountPath: /trust }
+          resources:
+            requests: { cpu: 10m, memory: 16Mi }
+            limits: { cpu: 100m, memory: 64Mi }
+
+        - name: secretproxy                 # native sidecar: starts before and outlives the agent
+          image: secretproxy-gateway:0.1.0
+          restartPolicy: Always
+          env:
+            - { name: MODE, value: local }
+            - { name: CONFIG, value: /etc/secretproxy/config.yaml }
+            - { name: CONFDIR, value: /etc/secretproxy/ca }
+            - { name: CREDENTIALS_DIRECTORY, value: /run/secrets/secretproxy }
+            - { name: DNS_ALLOWLIST, value: "1" }
+          securityContext:
+            runAsUser: 10001
+            runAsGroup: 10001
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: [ALL] }
+          startupProbe:                     # the agent starts only once the proxy listens
+            tcpSocket: { port: 8080, host: 127.0.0.1 }
+            periodSeconds: 1
+            failureThreshold: 60
+          livenessProbe:
+            tcpSocket: { port: 8080, host: 127.0.0.1 }
+            periodSeconds: 10
+          volumeMounts:
+            - { name: config, mountPath: /etc/secretproxy/config.yaml, subPath: config.yaml, readOnly: true }
+            - { name: proxy-ca, mountPath: /etc/secretproxy/ca, readOnly: true }
+            - { name: secrets, mountPath: /run/secrets/secretproxy, readOnly: true }
+            - { name: proxy-tmp, mountPath: /tmp }
+            - { name: proxy-home, mountPath: /home/mitm }
+          resources:
+            requests: { cpu: 50m, memory: 128Mi }
+            limits: { cpu: "1", memory: 512Mi }
+
+      containers:
+        - name: agent
+          image: REGISTRY/your-agent-image:TAG    # your workload; it needs no changes
+          envFrom:
+            - configMapRef: { name: agent-placeholders }   # e.g. OPENAI_API_KEY=sp_openai_...
+          env:
+            # Runtimes with their own CA store (the system path is covered by the mount below).
+            - { name: SSL_CERT_FILE, value: /etc/ssl/certs/ca-certificates.crt }
+            - { name: REQUESTS_CA_BUNDLE, value: /etc/ssl/certs/ca-certificates.crt }
+            - { name: CURL_CA_BUNDLE, value: /etc/ssl/certs/ca-certificates.crt }
+            - { name: NODE_EXTRA_CA_CERTS, value: /etc/secretproxy-trust/proxy-ca.crt }
+          securityContext:
+            runAsUser: 1000                 # never 10001: that uid is exempt from the rules
+            runAsGroup: 1000
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            capabilities: { drop: [ALL] }
+          volumeMounts:
+            # Debian/Ubuntu/Alpine path; RHEL-based images: /etc/pki/tls/certs/ca-bundle.crt
+            - { name: trust, mountPath: /etc/ssl/certs/ca-certificates.crt, subPath: ca-bundle.crt, readOnly: true }
+            - { name: trust, mountPath: /etc/secretproxy-trust, readOnly: true }
+
+      volumes:
+        - name: config
+          configMap: { name: secretproxy-config }
+        - name: secrets                     # real values: mounted ONLY in the sidecar
+          secret: { secretName: secretproxy-secrets, defaultMode: 0440 }
+        - name: proxy-ca                    # CA key + cert: mounted ONLY in the sidecar
+          secret: { secretName: secretproxy-ca, defaultMode: 0440 }
+        - name: proxy-ca-cert               # public cert only, for the trust bundle
+          secret:
+            secretName: secretproxy-ca
+            items: [{ key: mitmproxy-ca-cert.pem, path: ca.crt }]
+        - name: trust
+          emptyDir: { sizeLimit: 5Mi }
+        - name: proxy-tmp
+          emptyDir: { sizeLimit: 16Mi }
+        - name: proxy-home
+          emptyDir: { sizeLimit: 64Mi }

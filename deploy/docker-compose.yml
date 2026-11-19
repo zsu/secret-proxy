@@ -1,3 +1,6 @@
+# Topology "local" (sidecar): the sandbox shares the gateway's network namespace,
+# so the gateway's OUTPUT rules see every packet the sandbox sends.
+# Same pattern as running the proxy and the client app on one VM.
 name: secretproxy-demo
 
 services:
@@ -12,21 +15,23 @@ services:
   gateway:
     build: { context: .., dockerfile: deploy/gateway/Dockerfile }
     cap_add: [NET_ADMIN]
-    env_file: [runtime/gateway.env]           # env: provider source
+    environment: { MODE: local, UPSTREAM_CA: /etc/secretproxy/upstream-ca.pem }
+    env_file: [runtime/secrets.env]           # env: provider source
     secrets:                                  # file: and cmd: provider sources
       - { source: fakeapi_env, target: fakeapi.env }
       - { source: cmd_token, target: cmd_token }
     volumes:
       - ./runtime/ca:/home/mitm/.mitmproxy    # CA key + cert (gateway only)
       - ./config.yaml:/etc/secretproxy/config.yaml:ro
+      - ./runtime/certs/upstream-ca.pem:/etc/secretproxy/upstream-ca.pem:ro  # demo: trusts fakeapi
     depends_on: [fakeapi]
 
-  # The agent. Shares the gateway's network namespace (sidecar pattern), so every
-  # packet it sends hits the gateway's iptables rules. No capabilities, separate
-  # PID namespace and filesystem: it can't see the proxy process or its secrets.
+  # The agent. No capabilities, separate PID namespace and filesystem: it can't
+  # see the proxy process or its secrets.
   sandbox:
     build: { context: .., dockerfile: deploy/sandbox/Dockerfile }
     network_mode: "service:gateway"
+    user: "1000:1000"
     cap_drop: [ALL]
     security_opt: ["no-new-privileges:true"]
     env_file: [runtime/sandbox.env]           # placeholders only

@@ -1,0 +1,27 @@
+# secretproxy config for the Kubernetes sidecar (becomes the secretproxy-config ConfigMap).
+# No audit_log: the audit trail goes to the sidecar's stdout (kubectl logs ... -c secretproxy).
+# Secrets are files in the secretproxy-secrets Secret, mounted at ${CREDENTIALS_DIRECTORY}.
+# Generate your own placeholders: secretproxy new-placeholder openai
+default: deny
+tunnel:
+  - pypi.org
+  - files.pythonhosted.org
+  - registry.npmjs.org
+secrets:
+  - name: openai
+    value: file:${CREDENTIALS_DIRECTORY}/openai
+    placeholder: sp_openai_REPLACE-with-new-placeholder
+    sandbox_env: OPENAI_API_KEY
+    hosts: [api.openai.com]
+    paths: ["/v1/**"]
+    methods: [GET, POST]
+    substitute: [headers]
+    refresh_on: [401]
+  - name: anthropic
+    value: file:${CREDENTIALS_DIRECTORY}/anthropic
+    placeholder: sp_anthropic_REPLACE-with-new-placeholder
+    sandbox_env: ANTHROPIC_API_KEY
+    hosts: [api.anthropic.com]
+    paths: ["/v1/**"]
+    methods: [GET, POST]
+    substitute: [headers]

@@ -130,7 +130,7 @@ def parse_config(raw: dict[str, Any]) -> Config:
         if not refs:
             raise ConfigError(f"{where} ({name}): 'value' is required")
         placeholder = str(s.get("placeholder") or "")
-        if not PLACEHOLDER_RE.match(placeholder):
+        if not PLACEHOLDER_RE.match(placeholder) or "REPLACE" in placeholder.upper():
             raise ConfigError(
                 f"{where} ({name}): 'placeholder' must be >=16 chars of [A-Za-z0-9_.-] "
                 "(generate one with: python -m secretproxy new-placeholder NAME)"
@@ -190,4 +190,12 @@ def parse_config(raw: dict[str, Any]) -> Config:
 
 def load_config(path: str) -> Config:
     with open(path, "r", encoding="utf-8") as fh:
-        return parse_config(yaml.safe_load(fh) or {})
+        try:
+            raw = yaml.safe_load(fh) or {}
+        except yaml.YAMLError as exc:
+            mark = getattr(exc, "problem_mark", None)
+            where = f" (line {mark.line + 1}, column {mark.column + 1})" if mark else ""
+            hint = getattr(exc, "problem", None) or "invalid YAML"
+            raise ConfigError(f"{path}{where}: {hint}. Tip: quote values containing "
+                              "${...} inside [ ] lists") from None
+    return parse_config(raw)

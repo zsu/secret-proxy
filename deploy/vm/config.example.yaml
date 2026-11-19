@@ -1,0 +1,69 @@
+# /etc/secretproxy/config.yaml  (root:secretproxy 0640)
+# Production example. Replace every placeholder with your own:
+#     /opt/secretproxy/venv/bin/secretproxy new-placeholder openai
+# (secretproxy refuses to start while a placeholder still contains "REPLACE").
+
+audit_log: /var/log/secretproxy/audit.jsonl
+default: deny                    # hosts not listed below are refused (and don't resolve)
+
+# Decrypted and checked, never injected (lets you allow hosts while still
+# blocking placeholders sent to them). Optional.
+intercept: []
+
+# Passed through without decryption: package registries, git, cert-pinning tools.
+# No secret is ever injected into a tunnelled host.
+tunnel:
+  - pypi.org
+  - files.pythonhosted.org
+  - registry.npmjs.org
+  - github.com
+  - "*.githubusercontent.com"
+
+# Provider options. The built-ins (env, file, cmd, vault) need no entry unless
+# you want to set options; plugins are added here too.
+providers:
+  - scheme: vault
+    options:
+      addr: https://vault.internal.example:8200
+      token_file: ${CREDENTIALS_DIRECTORY}/vault_token   # itself a systemd credential
+  - scheme: cmd
+    options: { timeout: 10 }
+
+secrets:
+  # 1. Encrypted systemd credential (recommended): see README "Configure secrets".
+  - name: openai
+    value: file:${CREDENTIALS_DIRECTORY}/openai
+    placeholder: sp_openai_REPLACE-with-new-placeholder
+    sandbox_env: OPENAI_API_KEY          # the client app's env var holds the placeholder
+    hosts: [api.openai.com]
+    paths: ["/v1/**"]
+    methods: [GET, POST]
+    substitute: [headers]                # Authorization: Bearer <placeholder>
+    refresh_on: [401]
+
+  - name: anthropic
+    value: file:${CREDENTIALS_DIRECTORY}/anthropic
+    placeholder: sp_anthropic_REPLACE-with-new-placeholder
+    sandbox_env: ANTHROPIC_API_KEY
+    hosts: [api.anthropic.com]
+    paths: ["/v1/**"]
+    methods: [GET, POST]
+    substitute: [headers]                # x-api-key: <placeholder>
+
+  # 2. HashiCorp Vault, with the env var as a fallback for break-glass.
+  - name: github
+    value:                               # tried in order (quote ${...} inside [ ] lists)
+      - vault:secret/data/agents/github#token
+      - file:${CREDENTIALS_DIRECTORY}/github
+    placeholder: sp_github_REPLACE-with-new-placeholder
+    hosts: [api.github.com]
+    methods: [GET]                       # read-only, enforced by the binding
+    set_header: { name: Authorization, format: "Bearer {}" }   # the app sends nothing
+    ttl: 900                             # re-read from Vault every 15 minutes
+
+  # 3. Any secret manager through its CLI (runs on the gateway as the service user).
+  # - name: stripe
+  #   value: cmd:aws secretsmanager get-secret-value --secret-id prod/stripe --query SecretString --output text
+  #   placeholder: sp_stripe_REPLACE-with-new-placeholder
+  #   hosts: [api.stripe.com]
+  #   ttl: 3600

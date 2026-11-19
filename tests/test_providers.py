@@ -80,6 +80,16 @@ class FileTests(unittest.TestCase):
     def test_env_key(self):
         self.assertEqual(FileProvider().get(self.envf + "#OPENAI_API_KEY"), "sk-abc")
 
+    def test_credentials_directory_expansion(self):
+        os.environ["SP_TEST_CRED_DIR"] = self.dir
+        try:
+            self.assertEqual(FileProvider().get("${SP_TEST_CRED_DIR}/token"), "s3cr3t-token")
+        finally:
+            del os.environ["SP_TEST_CRED_DIR"]
+        with self.assertRaises(SecretError) as cm:
+            FileProvider().get("${SP_TEST_CRED_DIR}/token")
+        self.assertIn("SP_TEST_CRED_DIR", str(cm.exception))
+
     def test_missing_key_and_file(self):
         with self.assertRaises(SecretError):
             FileProvider().get(self.envf + "#NOPE")
