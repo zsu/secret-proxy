@@ -1,0 +1,37 @@
+name: secretproxy-demo
+
+services:
+  # Hermetic upstream standing in for real APIs.
+  fakeapi:
+    build: { context: .., dockerfile: deploy/fakeapi/Dockerfile }
+    networks:
+      default:
+        aliases: [api.example.test, evil.example.test, tunnel.example.test, intercepted.example.test]
+
+  # Owns the network namespace: iptables + mitmproxy + secrets. Never runs agent code.
+  gateway:
+    build: { context: .., dockerfile: deploy/gateway/Dockerfile }
+    cap_add: [NET_ADMIN]
+    env_file: [runtime/gateway.env]           # env: provider source
+    secrets:                                  # file: and cmd: provider sources
+      - { source: fakeapi_env, target: fakeapi.env }
+      - { source: cmd_token, target: cmd_token }
+    volumes:
+      - ./runtime/ca:/home/mitm/.mitmproxy    # CA key + cert (gateway only)
+      - ./config.yaml:/etc/secretproxy/config.yaml:ro
+    depends_on: [fakeapi]
+
+  # The agent. Shares the gateway's network namespace (sidecar pattern), so every
+  # packet it sends hits the gateway's iptables rules. No capabilities, separate
+  # PID namespace and filesystem: it can't see the proxy process or its secrets.
+  sandbox:
+    build: { context: .., dockerfile: deploy/sandbox/Dockerfile }
+    network_mode: "service:gateway"
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    env_file: [runtime/sandbox.env]           # placeholders only
+    depends_on: [gateway]
+
+secrets:
+  fakeapi_env: { file: ./runtime/secrets/fakeapi.env }
+  cmd_token: { file: ./runtime/secrets/cmd_token }

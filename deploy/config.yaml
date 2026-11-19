@@ -1,0 +1,33 @@
+# secretproxy config for the Docker demo. Placeholders are not secret; the real
+# values come from the three providers below and exist only in the gateway.
+audit_log: /home/mitm/audit.jsonl
+default: deny                      # hosts matching nothing below are refused
+intercept: [intercepted.example.test]   # decrypted + checked, never injected
+tunnel: [tunnel.example.test, pypi.org, "*.pythonhosted.org"]   # passed through, not decrypted
+
+secrets:
+  - name: fakeapi                  # file provider, .env key lookup
+    value: file:/run/secrets/fakeapi.env#FAKEAPI_TOKEN
+    placeholder: sp_fakeapi_7c1d0e5b9a2f4c38b6e1d2a3f4b5c6d7
+    sandbox_env: FAKEAPI_TOKEN
+    hosts: [api.example.test]
+    paths: ["/v1/**"]
+    methods: [GET, POST]
+    substitute: [headers, query]
+
+  - name: envtoken                 # env provider, always-on header (agent sends nothing)
+    value: env:ENV_TOKEN
+    placeholder: sp_envtoken_0a9b8c7d6e5f40312a3b4c5d6e7f8091
+    sandbox_env: ENV_TOKEN
+    hosts: [api.example.test]
+    paths: ["/env/**"]
+    set_header: { name: X-Api-Key, format: "{}" }
+
+  - name: cmdtoken                 # cmd provider, refreshed every 60s
+    value: cmd:cat /run/secrets/cmd_token
+    placeholder: sp_cmdtoken_5e4d3c2b1a0f49e8d7c6b5a4f3e2d1c0
+    sandbox_env: CMD_TOKEN
+    hosts: [api.example.test]
+    paths: ["/cmd/**"]
+    ttl: 60
+    refresh_on: [401]
